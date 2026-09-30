@@ -1,0 +1,73 @@
+name: CI / CD
+
+on:
+  push: { branches: [main] }
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env: { POSTGRES_USER: ci, POSTGRES_PASSWORD: ci, POSTGRES_DB: ci }
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U ci" --health-interval 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+      # Les tests d'intégration vident les tables : base dédiée au CI, jamais une base réelle.
+      DATABASE_URL_TEST: postgresql://ci:ci@localhost:5432/ci
+      REDIS_URL: redis://localhost:6379/0
+      NEXT_PUBLIC_SITE_URL: https://example.org
+      NEXT_PUBLIC_MEDIA_URL: https://media.example.org
+      NEXT_TELEMETRY_DISABLED: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npx prisma validate
+      - run: npx prisma migrate deploy
+      - name: Le schéma correspond aux migrations
+        run: npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
+      - run: npm run typecheck
+      - run: npm run lint
+      - name: Tests unitaires (domaine)
+        run: npm test
+      - name: Tests d'intégration (PostgreSQL + doubles Stripe / stockage / e-mail)
+        run: npm run test:integration
+      - name: Build (application + worker)
+        run: npm run build
+      - run: npm audit --omit=dev --audit-level=high
+
+  deploy:
+    needs: check
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Déploiement sur le serveur
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          fingerprint: ${{ secrets.DEPLOY_HOST_FINGERPRINT }}
+          script: |
+            set -e
+            cd ${{ secrets.DEPLOY_PATH }}
+            git fetch --quiet origin main
+            git reset --hard origin/main
+            docker compose build app worker migrate
+            docker compose up -d --remove-orphans
+            sleep 15
+            curl -fsS https://$(grep '^DOMAIN=' .env | cut -d= -f2)/api/ready
+            docker image prune -f

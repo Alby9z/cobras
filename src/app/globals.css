@@ -1,0 +1,78 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-display: var(--font-fraunces), ui-serif, Georgia, serif;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-card: var(--card);
+  --color-border: var(--border);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-danger: var(--danger);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-ring: var(--ring);
+  --radius-xl: 1rem;
+}
+
+/* Contrastes vérifiés WCAG AA (texte normal ≥ 4.5:1) */
+:root {
+  --background: #fafaf7;
+  --foreground: #1a1c17;
+  --muted: #efefe8;
+  --muted-foreground: #53574b;
+  --card: #ffffff;
+  --border: #dcdcd2;
+  --primary: #1f5130;
+  --primary-foreground: #ffffff;
+  --accent: #b45309;
+  --accent-foreground: #ffffff;
+  --danger: #b91c1c;
+  --success: #15803d;
+  --warning: #92400e;
+  --ring: #2f7a48;
+}
+
+.dark {
+  --background: #11140f;
+  --foreground: #ecefe6;
+  --muted: #1d221a;
+  --muted-foreground: #a9b0a0;
+  --card: #171b14;
+  --border: #2d3428;
+  --primary: #7fcf96;
+  --primary-foreground: #0d1a10;
+  --accent: #f59e0b;
+  --accent-foreground: #1a1203;
+  --danger: #f87171;
+  --success: #4ade80;
+  --warning: #fbbf24;
+  --ring: #7fcf96;
+}
+
+html { scroll-behavior: smooth; }
+body { background: var(--background); color: var(--foreground); -webkit-font-smoothing: antialiased; }
+:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
+/* Contenu riche (fiches, pages CMS, FAQ) */
+.prose-content { line-height: 1.7; }
+.prose-content h2 { font-family: var(--font-display); font-size: 1.5rem; font-weight: 600; margin: 1.75rem 0 0.75rem; }
+.prose-content h3 { font-size: 1.15rem; font-weight: 600; margin: 1.25rem 0 0.5rem; }
+.prose-content p { margin: 0 0 1rem; }
+.prose-content ul { list-style: disc; padding-left: 1.25rem; margin-bottom: 1rem; }
+.prose-content ol { list-style: decimal; padding-left: 1.25rem; margin-bottom: 1rem; }
+.prose-content a { color: var(--primary); text-decoration: underline; text-underline-offset: 3px; }
+.prose-content table { width: 100%; border-collapse: collapse; margin-bottom: 1rem; }
+.prose-content td, .prose-content th { border: 1px solid var(--border); padding: 0.5rem; text-align: left; }

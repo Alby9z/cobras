@@ -1,0 +1,31 @@
+{
+	email {$ACME_EMAIL}
+}
+
+# Redirection www → domaine principal
+www.{$DOMAIN} {
+	redir https://{$DOMAIN}{uri} permanent
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+	# Certificats TLS Let's Encrypt automatiques, HTTP → HTTPS automatique.
+	header {
+		-Server
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+	}
+	# Les ressources statiques Next.js sont immuables.
+	@static path /_next/static/*
+	header @static Cache-Control "public, max-age=31536000, immutable"
+
+	request_body {
+		max_size 15MB
+	}
+	reverse_proxy app:3000 {
+		header_up X-Forwarded-For {remote_host}
+	}
+	log {
+		output stdout
+		format json
+	}
+}

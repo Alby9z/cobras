@@ -1,0 +1,1140 @@
+// Schéma de données — plateforme e-commerce reptiles (phase 2 : socle transactionnel)
+// Conventions : montants en centimes (Int), taux en points de base (bps, 2000 = 20 %),
+// dates en UTC, énumérations centralisées (voir src/lib/labels.ts pour les libellés).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ═════════════════════════ Identité & accès ═════════════════════════
+
+enum Role {
+  SUPER_ADMIN
+  ADMIN
+  COMPLIANCE_MANAGER
+  SALES_MANAGER
+  SALES_AGENT
+  FULFILLMENT_MANAGER
+  WAREHOUSE_OPERATOR
+  CONTENT_MANAGER
+  SUPPORT_AGENT
+  ACCOUNTANT
+  VIEWER
+  CUSTOMER
+}
+
+model User {
+  id               String    @id
+  name             String
+  email            String    @unique
+  emailVerified    Boolean   @default(false)
+  image            String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  twoFactorEnabled Boolean?  @default(false)
+  firstName        String
+  lastName         String
+  birthDate        DateTime  @db.Date
+  phone            String?
+  role             Role      @default(CUSTOMER)
+  banned           Boolean   @default(false)
+  marketingOptIn   Boolean   @default(false)
+
+  sessions          Session[]
+  accounts          Account[]
+  twoFactors        TwoFactor[]
+  addresses         Address[]
+  orders            Order[]
+  documents         Document[]          @relation("DocumentOwner")
+  reviewedDocs      Document[]          @relation("DocumentReviewer")
+  wishlist          WishlistItem[]
+  cart              Cart?
+  notifications     Notification[]
+  orderEvents       OrderEvent[]
+  complianceRules   ComplianceRule[]    @relation("RuleReviewer")
+  complianceCases   ComplianceCase[]    @relation("CaseDecider")
+  animalEvents      AnimalEvent[]
+
+  @@map("user")
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([userId])
+  @@map("account")
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+  @@map("verification")
+}
+
+model TwoFactor {
+  id                      String    @id
+  secret                  String
+  backupCodes             String
+  userId                  String
+  user                    User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  verified                Boolean?  @default(true)
+  failedVerificationCount Int?      @default(0)
+  lockedUntil             DateTime?
+
+  @@index([secret])
+  @@index([userId])
+  @@map("twoFactor")
+}
+
+model RateLimit {
+  id          String @id
+  key         String @unique
+  count       Int
+  lastRequest BigInt
+
+  @@map("rateLimit")
+}
+
+// ═════════════════════════ Référentiel espèces & conformité ═════════════════════════
+
+/// Catégorie métier configurable — descriptive, ce n'est PAS une conclusion juridique.
+/// SALE_PROHIBITED bloque la vente ; RESTRICTED impose un examen humain.
+/// Les exigences concrètes proviennent des ComplianceRule actives et validées.
+enum RegulatoryCategory {
+  SALE_ALLOWED
+  SALE_ALLOWED_WITH_DOCUMENTS
+  DECLARATION_REQUIRED
+  CERTIFICATE_REQUIRED
+  AUTHORIZATION_REQUIRED
+  RESTRICTED
+  SALE_PROHIBITED
+}
+
+enum DocumentType {
+  IDENTITY_DOCUMENT
+  ADDRESS_PROOF
+  CERTIFICATE
+  AUTHORIZATION
+  DECLARATION
+  CITES_DOCUMENT
+  REGULATORY_DOCUMENT
+  OTHER
+}
+
+enum ShippingMethod {
+  PICKUP // retrait sur place
+  SPECIALIZED_CARRIER // transporteur spécialisé animaux vivants
+  STANDARD_PARCEL // colis standard (hors animaux)
+}
+
+model Species {
+  id                    String             @id @default(cuid())
+  scientificName        String             @unique
+  commonName            String
+  slug                  String             @unique
+  synonyms              String[]
+  family                String?
+  regulatoryCategory    RegulatoryCategory @default(SALE_ALLOWED)
+  citesAnnex            String? // A, B, C, D (règlement UE 338/97) — information, pas une règle
+  protectionStatus      String?
+  regulatoryNotes       String? // texte public
+  restrictionsNotes     String? // texte public
+  // Transport
+  shippingMethods       ShippingMethod[]
+  deliveryAvailable     Boolean            @default(true)
+  transportConditions   String? // texte public
+  packagingRequirements String? // interne
+  carrierConstraints    String? // interne
+  allowedShipDays       Int[] // 1 = lundi … 7 = dimanche (ISO) ; vide = tous les jours
+  // Maintenance
+  careDifficulty        Int?
+  temperatureRange      String?
+  humidityRange         String?
+  diet                  String?
+  recommendedTerrarium  String?
+  createdAt             DateTime           @default(now())
+  updatedAt             DateTime           @updatedAt
+
+  animals Animal[]
+  rules   ComplianceRule[]
+
+  @@map("species")
+}
+
+enum ComplianceRuleType {
+  SALE_PROHIBITION // interdit la vente dans le périmètre
+  DOCUMENT_REQUIREMENT // exige des documents validés
+  AGE_REQUIREMENT // âge minimum de l'acheteur
+  GEO_RESTRICTION // zones interdites ou seules autorisées
+  SHIPPING_RESTRICTION // modes / jours d'expédition
+  HUMAN_REVIEW // impose un examen humain renforcé
+}
+
+enum RuleBasis {
+  LEGAL // référence juridique obligatoire
+  COMMERCIAL_POLICY // politique commerciale de l'entreprise
+}
+
+enum RuleStatus {
+  DRAFT
+  ACTIVE
+  RETIRED
+}
+
+enum ProductType {
+  ANIMAL
+  ACCESSORY
+  EQUIPMENT
+}
+
+/// Règle versionnée : une règle ACTIVE n'est jamais modifiée ; une modification crée
+/// une nouvelle version (même code, version + 1) et retire la précédente.
+model ComplianceRule {
+  id                 String              @id @default(cuid())
+  code               String // ex. FR-AGE-MIN, FR-PYTHON-DOCS
+  version            Int                 @default(1)
+  name               String
+  jurisdiction       String // ex. FR, FR-84, EU
+  type               ComplianceRuleType
+  basis              RuleBasis
+  status             RuleStatus          @default(DRAFT)
+  // Périmètre (au moins un, sinon la règle vise tous les articles des types listés)
+  speciesId          String?
+  species            Species?            @relation(fields: [speciesId], references: [id], onDelete: Restrict)
+  regulatoryCategory RegulatoryCategory?
+  productTypes       ProductType[]
+  // Paramètres
+  conditions         Json? // géographie : { mode, zones[] } ; expédition : { methods[], shipDays[] }
+  requiredDocuments  DocumentType[]
+  minimumAge         Int?
+  customerMessage    String? // message affiché au client en cas de déclenchement
+  // Traçabilité juridique
+  legalReference     String?
+  sourceUrl          String?
+  effectiveFrom      DateTime
+  effectiveUntil     DateTime?
+  reviewedAt         DateTime?
+  reviewedById       String?
+  reviewedBy         User?               @relation("RuleReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  supersedesId       String?             @unique
+  supersedes         ComplianceRule?     @relation("RuleVersions", fields: [supersedesId], references: [id])
+  supersededBy       ComplianceRule?     @relation("RuleVersions")
+  createdAt          DateTime            @default(now())
+
+  @@unique([code, version])
+  @@index([status, type])
+  @@map("compliance_rule")
+}
+
+enum ComplianceCaseStatus {
+  OPEN
+  AWAITING_DOCUMENTS
+  IN_REVIEW
+  APPROVED
+  REJECTED
+}
+
+model ComplianceCase {
+  id               String                 @id @default(cuid())
+  number           Int                    @unique @default(autoincrement())
+  orderId          String                 @unique
+  order            Order                  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  status           ComplianceCaseStatus   @default(OPEN)
+  ruleSetVersion   String
+  lastEvaluation   Json
+  decidedById      String?
+  decidedBy        User?                  @relation("CaseDecider", fields: [decidedById], references: [id], onDelete: SetNull)
+  decidedAt        DateTime?
+  justification    String?
+  overridden       Boolean                @default(false)
+  overriddenChecks String[]
+  evaluations      ComplianceEvaluation[]
+  createdAt        DateTime               @default(now())
+  updatedAt        DateTime               @updatedAt
+
+  @@index([status])
+  @@map("compliance_case")
+}
+
+enum EvaluationStage {
+  CHECKOUT
+  PAYMENT
+  REVIEW
+  DECISION
+  FULFILLMENT
+}
+
+/// Historique immuable de chaque évaluation (règles appliquées, données utilisées, résultat).
+model ComplianceEvaluation {
+  id             String          @id @default(cuid())
+  caseId         String
+  case           ComplianceCase  @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  stage          EvaluationStage
+  allowed        Boolean
+  result         Json
+  ruleSetVersion String
+  actorId        String?
+  createdAt      DateTime        @default(now())
+
+  @@index([caseId])
+  @@map("compliance_evaluation")
+}
+
+// ═════════════════════════ Catalogue ═════════════════════════
+
+enum ProductStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum Sex {
+  MALE
+  FEMALE
+  UNKNOWN
+}
+
+enum PaymentStrategy {
+  PAY_IMMEDIATELY
+  AUTHORIZE_THEN_CAPTURE
+  DEPOSIT_THEN_BALANCE
+  PAY_AFTER_COMPLIANCE
+}
+
+model Category {
+  id              String     @id @default(cuid())
+  name            String
+  slug            String     @unique
+  description     String?
+  metaTitle       String?
+  metaDescription String?
+  parentId        String?
+  parent          Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children        Category[] @relation("CategoryTree")
+  position        Int        @default(0)
+  products        Product[]
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  @@map("category")
+}
+
+model TaxRate {
+  id        String    @id @default(cuid())
+  code      String    @unique // ex. FR-STANDARD
+  name      String
+  country   String    @default("FR")
+  rateBps   Int // 2000 = 20 %
+  active    Boolean   @default(true)
+  products  Product[]
+  createdAt DateTime  @default(now())
+
+  @@map("tax_rate")
+}
+
+/// Fiche commerciale. Pour un animal, les données individuelles sont dans Animal (1–1).
+model Product {
+  id                 String           @id @default(cuid())
+  type               ProductType
+  status             ProductStatus    @default(DRAFT)
+  name               String
+  slug               String           @unique
+  sku                String?          @unique
+  description        String // Markdown, assaini à l'affichage
+  shortDescription   String?
+  priceCents         Int // TTC
+  compareAtCents     Int?
+  taxRateId          String?
+  taxRate            TaxRate?         @relation(fields: [taxRateId], references: [id], onDelete: Restrict)
+  paymentStrategy    PaymentStrategy? // null = stratégie par défaut
+  depositPercent     Int?
+  // Stock (accessoires / équipements ; pour un animal : 1 et piloté par Animal.status)
+  stockOnHand        Int              @default(0)
+  stockReserved      Int              @default(0)
+  lowStockAlert      Int              @default(1)
+  // Champs accessoires / équipements
+  ean                String?
+  brand              String?
+  supplier           String?
+  purchasePriceCents Int?
+  weightGrams        Int?
+  lengthMm           Int?
+  widthMm            Int?
+  heightMm           Int?
+  featured           Boolean          @default(false)
+  metaTitle          String?
+  metaDescription    String?
+  categoryId         String?
+  category           Category?        @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  version            Int              @default(0) // verrou optimiste (éditions concurrentes)
+
+  animal        Animal?
+  images        ProductImage[]
+  related       ProductRelation[]   @relation("ProductRelationFrom")
+  relatedTo     ProductRelation[]   @relation("ProductRelationTo")
+  orderItems    OrderItem[]
+  cartItems     CartItem[]
+  wishlistItems WishlistItem[]
+  movements     InventoryMovement[]
+  reservations  StockReservation[]
+  viewCount     Int                 @default(0)
+  soldCount     Int                 @default(0)
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  @@index([status, type])
+  @@index([categoryId])
+  @@map("product")
+}
+
+enum AnimalStatus {
+  AVAILABLE
+  RESERVED
+  ALLOCATED
+  PREPARING
+  SHIPPED
+  SOLD
+  RETURNED
+  QUARANTINED
+  UNAVAILABLE
+}
+
+enum AnimalOrigin {
+  CAPTIVE_BRED // né en captivité
+  CAPTIVE_BRED_OWN // né dans notre élevage
+  RANCHED
+  WILD_CAUGHT
+  UNKNOWN
+}
+
+model Animal {
+  id                      String       @id @default(cuid())
+  productId               String       @unique
+  product                 Product      @relation(fields: [productId], references: [id], onDelete: Restrict)
+  speciesId               String
+  species                 Species      @relation(fields: [speciesId], references: [id], onDelete: Restrict)
+  subspecies              String?
+  morph                   String?
+  sex                     Sex          @default(UNKNOWN)
+  birthDate               DateTime?    @db.Date
+  sizeCm                  Decimal?     @db.Decimal(6, 1)
+  weightG                 Decimal?     @db.Decimal(8, 1)
+  origin                  AnimalOrigin @default(UNKNOWN)
+  originDetails           String? // public
+  acquisitionDate         DateTime?    @db.Date
+  identificationReference String? // interne (puce, bague…) — jamais affiché publiquement
+  status                  AnimalStatus @default(UNAVAILABLE)
+  healthStatus            String? // interne
+  location                String? // interne
+  internalNotes           String?
+  careDifficulty          Int?
+  temperatureRange        String?
+  humidityRange           String?
+  diet                    String?
+  recommendedTerrarium    String?
+  videoUrls               String[]
+  events                  AnimalEvent[]
+  createdAt               DateTime     @default(now())
+  updatedAt               DateTime     @updatedAt
+
+  @@index([speciesId])
+  @@index([status])
+  @@map("animal")
+}
+
+/// Historique d'un animal (statuts, mesures, mouvements, ventes).
+model AnimalEvent {
+  id         String        @id @default(cuid())
+  animalId   String
+  animal     Animal        @relation(fields: [animalId], references: [id], onDelete: Cascade)
+  type       String // STATUS_CHANGE, MEASURE, LOCATION, HEALTH, NOTE
+  fromStatus AnimalStatus?
+  toStatus   AnimalStatus?
+  note       String?
+  reference  String? // n° de commande…
+  actorId    String?
+  actor      User?         @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  createdAt  DateTime      @default(now())
+
+  @@index([animalId])
+  @@map("animal_event")
+}
+
+model ProductImage {
+  id         String  @id @default(cuid())
+  productId  String
+  product    Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  storageKey String
+  width      Int?
+  height     Int?
+  alt        String
+  position   Int     @default(0)
+
+  @@index([productId])
+  @@map("product_image")
+}
+
+model ProductRelation {
+  fromId String
+  toId   String
+  from   Product @relation("ProductRelationFrom", fields: [fromId], references: [id], onDelete: Cascade)
+  to     Product @relation("ProductRelationTo", fields: [toId], references: [id], onDelete: Cascade)
+
+  @@id([fromId, toId])
+  @@map("product_relation")
+}
+
+model WishlistItem {
+  userId    String
+  productId String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([userId, productId])
+  @@map("wishlist_item")
+}
+
+// ═════════════════════════ Inventaire ═════════════════════════
+
+enum InventoryMovementType {
+  RECEIPT
+  ADJUSTMENT
+  RESERVATION
+  RESERVATION_RELEASE
+  ALLOCATION
+  SHIPMENT
+  RETURN
+  STATUS_CHANGE
+}
+
+/// Journal immuable des mouvements de stock.
+model InventoryMovement {
+  id             String                @id @default(cuid())
+  productId      String
+  product        Product               @relation(fields: [productId], references: [id], onDelete: Restrict)
+  animalId       String?
+  type           InventoryMovementType
+  quantity       Int // variation signée du stock concerné
+  stockBefore    Int
+  stockAfter     Int
+  reservedBefore Int
+  reservedAfter  Int
+  reason         String
+  reference      String? // n° de commande, bon de réception…
+  actorId        String? // pas de clé étrangère (journal immuable)
+  requestId      String?
+  createdAt      DateTime              @default(now())
+
+  @@index([productId, createdAt])
+  @@map("inventory_movement")
+}
+
+enum ReservationStatus {
+  ACTIVE
+  ALLOCATED // paiement reçu / autorisé
+  RELEASED
+  CONSUMED // expédié
+}
+
+model StockReservation {
+  id         String            @id @default(cuid())
+  orderId    String
+  order      Order             @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId  String
+  product    Product           @relation(fields: [productId], references: [id], onDelete: Restrict)
+  animalId   String?
+  quantity   Int
+  status     ReservationStatus @default(ACTIVE)
+  expiresAt  DateTime?
+  releasedAt DateTime?
+  createdAt  DateTime          @default(now())
+
+  @@index([orderId])
+  @@index([status, expiresAt])
+  @@map("stock_reservation")
+}
+
+// ═════════════════════════ Panier & promotions ═════════════════════════
+
+model Cart {
+  id             String     @id @default(cuid())
+  userId         String?    @unique
+  user           User?      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  guestToken     String?    @unique
+  couponCode     String?
+  items          CartItem[]
+  reminderSentAt DateTime?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  @@map("cart")
+}
+
+model CartItem {
+  id        String  @id @default(cuid())
+  cartId    String
+  cart      Cart    @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  quantity  Int
+
+  @@unique([cartId, productId])
+  @@map("cart_item")
+}
+
+enum CouponType {
+  PERCENT
+  FIXED
+  FREE_SHIPPING
+}
+
+model Coupon {
+  id              String     @id @default(cuid())
+  code            String     @unique
+  type            CouponType
+  value           Int
+  minOrderCents   Int        @default(0)
+  maxUses         Int?
+  usedCount       Int        @default(0)
+  accessoriesOnly Boolean    @default(false)
+  startsAt        DateTime?
+  endsAt          DateTime?
+  active          Boolean    @default(true)
+  createdAt       DateTime   @default(now())
+
+  @@map("coupon")
+}
+
+model ShippingRate {
+  id             String         @id @default(cuid())
+  name           String
+  method         ShippingMethod
+  countries      String[]
+  priceCents     Int // TTC
+  freeAboveCents Int?
+  active         Boolean        @default(true)
+  position       Int            @default(0)
+
+  @@map("shipping_rate")
+}
+
+// ═════════════════════════ Adresses ═════════════════════════
+
+model Address {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  label      String?
+  firstName  String
+  lastName   String
+  company    String?
+  line1      String
+  line2      String?
+  postalCode String
+  city       String
+  country    String
+  phone      String
+  isDefault  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([userId])
+  @@map("address")
+}
+
+// ═════════════════════════ Commandes ═════════════════════════
+
+/// Machine à états : voir src/lib/domain/order-state.ts (transitions et gardes).
+enum OrderStatus {
+  DRAFT
+  PENDING_PAYMENT
+  PAYMENT_AUTHORIZED
+  PAYMENT_FAILED
+  COMPLIANCE_PENDING
+  DOCUMENTS_REQUIRED
+  DOCUMENTS_REVIEW
+  COMPLIANCE_APPROVED
+  COMPLIANCE_REJECTED
+  AWAITING_BALANCE
+  READY_FOR_FULFILLMENT
+  PREPARING
+  SHIPPED
+  DELIVERED
+  DELIVERY_FAILED
+  CANCELLED
+  REFUND_PENDING
+  REFUNDED
+}
+
+model Order {
+  id                  String            @id @default(cuid())
+  number              String            @unique
+  userId              String
+  user                User              @relation(fields: [userId], references: [id], onDelete: Restrict)
+  status              OrderStatus       @default(DRAFT)
+  version             Int               @default(0) // verrou optimiste
+  idempotencyKey      String
+  paymentStrategy     PaymentStrategy
+  containsAnimals     Boolean           @default(false)
+  currency            String            @default("EUR")
+  // Snapshots d'adresse
+  shippingAddress     Json
+  billingAddress      Json
+  shippingCountry     String
+  shippingDepartment  String?
+  shippingRegion      String?
+  shippingMethod      ShippingMethod
+  shippingRateName    String
+  // Montants (centimes)
+  subtotalCents       Int // TTC avant remise
+  discountCents       Int               @default(0)
+  shippingCents       Int // TTC
+  shippingExclTaxCents Int
+  shippingTaxRateBps  Int
+  totalExclTaxCents   Int
+  taxCents            Int
+  totalCents          Int // TTC
+  amountDueNowCents   Int
+  amountPaidCents     Int               @default(0)
+  amountAuthorizedCents Int             @default(0)
+  amountRefundedCents Int               @default(0)
+  couponCode          String?
+  requiredDocuments   DocumentType[]
+  reservationExpiresAt DateTime?
+  trackingCarrier     String?
+  trackingNumber      String?
+  trackingUrl         String?
+  customerNote        String?
+  preparedAt          DateTime?
+  shippedAt           DateTime?
+  deliveredAt         DateTime?
+  items               OrderItem[]
+  events              OrderEvent[]
+  payments            Payment[]
+  documents           OrderDocument[]
+  invoices            Invoice[]
+  reservations        StockReservation[]
+  complianceCase      ComplianceCase?
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  @@unique([userId, idempotencyKey])
+  @@index([userId])
+  @@index([status])
+  @@map("order")
+}
+
+/// Snapshot figé de la ligne : une modification ultérieure du produit n'a aucun effet.
+model OrderItem {
+  id                String      @id @default(cuid())
+  orderId           String
+  order             Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId         String
+  product           Product     @relation(fields: [productId], references: [id], onDelete: Restrict)
+  animalId          String?
+  productType       ProductType
+  name              String
+  sku               String?
+  speciesName       String?
+  quantity          Int
+  unitCents         Int // TTC
+  taxRateBps        Int
+  discountCents     Int // TTC, part de remise affectée
+  totalExclTaxCents Int
+  taxCents          Int
+  totalCents        Int // TTC après remise
+  currency          String      @default("EUR")
+
+  @@index([orderId])
+  @@map("order_item")
+}
+
+model OrderEvent {
+  id         String       @id @default(cuid())
+  orderId    String
+  order      Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  fromStatus OrderStatus?
+  status     OrderStatus?
+  message    String
+  internal   Boolean      @default(false)
+  actorId    String?
+  actor      User?        @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  requestId  String?
+  createdAt  DateTime     @default(now())
+
+  @@index([orderId])
+  @@map("order_event")
+}
+
+enum PaymentKind {
+  FULL
+  DEPOSIT
+  BALANCE
+}
+
+enum PaymentStatus {
+  PENDING
+  AUTHORIZED
+  SUCCEEDED
+  FAILED
+  EXPIRED
+  CANCELED
+}
+
+model Payment {
+  id                     String        @id @default(cuid())
+  orderId                String
+  order                  Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  kind                   PaymentKind
+  status                 PaymentStatus @default(PENDING)
+  manualCapture          Boolean       @default(false)
+  amountCents            Int
+  stripeCheckoutId       String        @unique
+  stripePaymentIntentId  String?       @unique
+  authorizedAt           DateTime?
+  authorizationExpiresAt DateTime?
+  capturedAt             DateTime?
+  failureCode            String?
+  failureMessage         String?
+  refunds                Refund[]
+  invoices               Invoice[]
+  createdAt              DateTime      @default(now())
+  updatedAt              DateTime      @updatedAt
+
+  @@index([orderId])
+  @@map("payment")
+}
+
+model Refund {
+  id             String    @id @default(cuid())
+  paymentId      String
+  payment        Payment   @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  amountCents    Int
+  reason         String
+  stripeRefundId String    @unique
+  status         String
+  createdById    String?
+  invoices       Invoice[]
+  createdAt      DateTime  @default(now())
+
+  @@map("refund")
+}
+
+enum InvoiceKind {
+  INVOICE
+  DEPOSIT_INVOICE
+  BALANCE_INVOICE
+  CREDIT_NOTE
+}
+
+enum PdfStatus {
+  PENDING
+  READY
+  FAILED
+}
+
+/// Facture émise = immuable (trigger PostgreSQL). Seuls pdfStorageKey / pdfStatus évoluent.
+/// Toute correction passe par un avoir (CREDIT_NOTE) référençant la facture d'origine.
+model Invoice {
+  id                String      @id @default(cuid())
+  number            String      @unique
+  kind              InvoiceKind
+  orderId           String
+  order             Order       @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  paymentId         String?
+  payment           Payment?    @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  refundId          String?
+  refund            Refund?     @relation(fields: [refundId], references: [id], onDelete: Restrict)
+  creditedInvoiceId String?
+  creditedInvoice   Invoice?    @relation("CreditNotes", fields: [creditedInvoiceId], references: [id], onDelete: Restrict)
+  creditNotes       Invoice[]   @relation("CreditNotes")
+  issuedAt          DateTime    @default(now())
+  seller            Json
+  customer          Json
+  lines             Json
+  vatBreakdown      Json
+  totalExclTaxCents Int
+  taxCents          Int
+  totalCents        Int
+  currency          String      @default("EUR")
+  legalMentions     String?
+  pdfStatus         PdfStatus   @default(PENDING)
+  pdfStorageKey     String?
+  createdAt         DateTime    @default(now())
+
+  @@unique([paymentId, kind])
+  @@unique([refundId])
+  @@index([orderId])
+  @@map("invoice")
+}
+
+model Counter {
+  name  String @id
+  value Int    @default(0)
+
+  @@map("counter")
+}
+
+// ═════════════════════════ Documents ═════════════════════════
+
+enum DocumentStatus {
+  PENDING_SCAN
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+  INFECTED
+  SCAN_FAILED
+}
+
+model Document {
+  id           String          @id @default(cuid())
+  userId       String
+  user         User            @relation("DocumentOwner", fields: [userId], references: [id], onDelete: Cascade)
+  type         DocumentType
+  status       DocumentStatus  @default(PENDING_SCAN)
+  originalName String
+  mimeType     String
+  extension    String
+  sizeBytes    Int
+  sha256       String
+  storageKey   String          @unique
+  expiresAt    DateTime?       @db.Date
+  reviewNote   String?
+  reviewedById String?
+  reviewedBy   User?           @relation("DocumentReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  reviewedAt   DateTime?
+  orders       OrderDocument[]
+  createdAt    DateTime        @default(now())
+
+  @@index([userId, type])
+  @@index([status])
+  @@map("document")
+}
+
+model OrderDocument {
+  orderId    String
+  documentId String
+  order      Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@id([orderId, documentId])
+  @@map("order_document")
+}
+
+// ═════════════════════════ Contenus ═════════════════════════
+
+model Page {
+  id              String   @id @default(cuid())
+  slug            String   @unique
+  title           String
+  content         String
+  metaDescription String?
+  published       Boolean  @default(false)
+  updatedAt       DateTime @updatedAt
+  createdAt       DateTime @default(now())
+
+  @@map("page")
+}
+
+model Faq {
+  id        String   @id @default(cuid())
+  question  String
+  answer    String
+  position  Int      @default(0)
+  onHome    Boolean  @default(false)
+  published Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  @@map("faq")
+}
+
+model Testimonial {
+  id        String   @id @default(cuid())
+  author    String
+  location  String?
+  content   String
+  rating    Int?
+  consentAt DateTime
+  published Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@map("testimonial")
+}
+
+enum ContactKind {
+  CONTACT
+  QUOTE
+  AUDIT
+}
+
+enum ContactStatus {
+  NEW
+  IN_PROGRESS
+  CLOSED
+}
+
+model ContactRequest {
+  id            String        @id @default(cuid())
+  kind          ContactKind   @default(CONTACT)
+  status        ContactStatus @default(NEW)
+  name          String
+  email         String
+  phone         String?
+  subject       String?
+  message       String
+  userId        String?
+  assignedToId  String?
+  internalNotes String?
+  consentAt     DateTime
+  ip            String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@index([status])
+  @@map("contact_request")
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  body      String
+  href      String?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, readAt])
+  @@map("notification")
+}
+
+model Setting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+
+  @@map("setting")
+}
+
+// ═════════════════════════ Traçabilité & intégrations ═════════════════════════
+
+/// Journal d'audit en ajout seul : UPDATE et DELETE refusés par trigger PostgreSQL.
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String? // pas de clé étrangère : l'historique survit à la suppression du compte
+  actorRole String?
+  action    String
+  entity    String
+  entityId  String?
+  before    Json?
+  after     Json?
+  reason    String?
+  data      Json?
+  ip        String?
+  userAgent String?
+  requestId String?
+  createdAt DateTime @default(now())
+
+  @@index([entity, entityId])
+  @@index([actorId, createdAt])
+  @@index([createdAt])
+  @@map("audit_log")
+}
+
+enum StripeEventStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  FAILED
+  IGNORED
+}
+
+model StripeEvent {
+  id          String            @id // evt_…
+  type        String
+  status      StripeEventStatus @default(RECEIVED)
+  payload     Json
+  attempts    Int               @default(0)
+  lastError   String?
+  receivedAt  DateTime          @default(now())
+  processedAt DateTime?
+
+  @@index([status])
+  @@map("stripe_event")
+}
+
+enum EmailStatus {
+  QUEUED
+  SENT
+  FAILED
+}
+
+model EmailLog {
+  id              String      @id @default(cuid())
+  dedupeKey       String      @unique
+  template        String
+  templateVersion Int
+  to              String
+  subject         String
+  payload         Json? // données du modèle ; effacées après envoi (peuvent contenir un lien à usage unique)
+  status          EmailStatus @default(QUEUED)
+  providerId      String?
+  error           String?
+  retryCount      Int         @default(0)
+  userId          String?
+  orderId         String?
+  sentAt          DateTime?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  @@index([status, createdAt])
+  @@map("email_log")
+}
+
+model AppRateLimit {
+  key       String   @id
+  count     Int
+  windowEnd DateTime
+
+  @@map("app_rate_limit")
+}
